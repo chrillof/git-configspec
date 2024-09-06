@@ -38,6 +38,20 @@ class GitConfigSpecTest(unittest.TestCase):
                                      "element \"dir with/space.foo\" B"))
         expected = [uut.ConfigSpecRule("element", "a/file with space.txt", "A"),
                     uut.ConfigSpecRule("element", "dir with/space.foo", "B")]
+        self.assertEqual(actual, expected)
+
+    def test_line_parser_with_git_specific_symbols(self):
+        actual = uut.parse_iterable(("element file.txt HEAD",
+                                     "element file.txt HEAD~1",
+                                     "element file.txt main",
+                                     "element file.txt origin/main",
+                                     "element file.txt origin/fix/foo"))
+        expected = [uut.ConfigSpecRule("element", "file.txt", "HEAD"),
+                    uut.ConfigSpecRule("element", "file.txt", "HEAD~1"),
+                    uut.ConfigSpecRule("element", "file.txt", "main"),
+                    uut.ConfigSpecRule("element", "file.txt", "origin/main"),
+                    uut.ConfigSpecRule("element", "file.txt", "origin/fix/foo")]
+
 
         self.assertEqual(actual, expected)
 
