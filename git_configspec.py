@@ -4,6 +4,8 @@ import re
 import sys
 
 import logging
+import traceback
+import subprocess
 
 from typing import Iterable
 from dataclasses import dataclass
@@ -22,6 +24,8 @@ _CS_SCOPE_RULE = re.compile(r"""(?P<scope>element)\s+
 
 @dataclass
 class ConfigSpecRule:
+    """ A config spec rule that can be transformed into a git command. """
+
     scope: str
     pattern: str
     selector: str
@@ -33,66 +37,97 @@ class ConfigSpecRule:
 
 @dataclass
 class PreparedCommand:
-    gitroot: Path
-    rule: ConfigSpecRule
+    """ A command to be executed. """
 
-def parse_file(path: Path) -> list:
+    gitdir: Path
+    selector: str
+    pattern: Path
+
+    def __str__(self) -> str:
+        return ' '.join(self.as_tuple())
+
+    def as_tuple(self) -> tuple[str]:
+        """ Retrieve this command as a tuple, ready to execute by e.g. 
+            subprocess.run.
+        """
+
+        return ('git', '-C', str(self.gitdir), 'checkout',
+                '--recurse-submodules',
+                self.selector, '--', str(self.pattern))
+
+def parse_file(path: Path) -> Iterable[ConfigSpecRule]:
+    """ Parses the file at the given location and extracts the rules. """
+
     with open(path, 'r', encoding="utf8") as config_spec:
         return parse_iterable(config_spec)
 
 def parse_iterable(config_spec: Iterable[str]) -> Iterable[ConfigSpecRule]:
+    """ Parses the given iterable as a sequence of config spec rules. """
+
     data = []
+    logger.info("Parsing config spec rules.")
     for line_no, line in enumerate(config_spec, start=1):
         if line:
             if not _COMMENT.match(line):
                 matches = _CS_SCOPE_RULE.match(line)
 
                 if matches:
-                    data.append(
-                        ConfigSpecRule(
+                    logging.debug("Match @ %2d: %s", line_no, line.strip())
+                    rule = ConfigSpecRule(
                             scope=matches.group("scope"),
                             pattern=matches.group("pattern").strip("\""),
-                            selector=matches.group("selector")))
+                            selector=matches.group("selector"))
+                    data.append(rule)
+                    logging.info("Rule: %s", rule)
                 else:
                     # Its not a comment nor a blank line.
                     logger.warning("Expected rule on line %d: %s",
                                    line_no, line)
     return data
 
-def prepare_cmd(spec: Iterable[ConfigSpecRule]) -> Iterable[tuple[str]]:
-    """ Generates the equivalent git commands from the config spec rules. """
-    commands = []
-    for r in spec:
-        path = Path(r.pattern)
+def to_commands(spec: Iterable[ConfigSpecRule],
+                relative_root: Path = Path("."),
+                ignore_nonexisting: bool = False) -> Iterable[PreparedCommand]:
+    """ Transforms the set of rules to the appropriate git commands.
 
-        if path.is_file() or path.name == "*":
-            logger.debug("Pattern targets a file: %s", path)
-            gitroot = path.parent
+        relative_root: Path
+            describes the location of the config spec, to which all commands
+            are relative to if the patterns are relative.
+
+        ignore_nonexisting: bool
+            determines whether to ignore nonexisting paths in the pattern.
+    """
+
+    logger.debug("Relative root (config spec location): %s", relative_root)
+    command_list = []
+    for rule in spec:
+        pattern = Path(rule.pattern)
+        gitdir = (relative_root / pattern).parent
+        if ignore_nonexisting or gitdir.exists():
+            command_list.append(
+                PreparedCommand(gitdir=gitdir,
+                                selector=rule.selector,
+                                pattern=pattern.relative_to(gitdir)))
         else:
-            logger.debug("Pattern targets a directory: %s", path)
-            gitroot = path
+            raise FileNotFoundError(f"Non-existing directory: {gitdir}")
 
-        commands.append(PreparedCommand(gitroot, r))
+    return command_list
 
-    return commands
+def apply(commands_to_apply: Iterable[PreparedCommand],
+          dry_run: bool = True) -> None:
+    """ Executes the sequence of commands in order. 
 
-def to_git_command(prepared_cmd: PreparedCommand) -> tuple[str]:
-    return ('git', '-C', str(prepared_cmd.gitroot),
-            'checkout', prepared_cmd.rule.selector, '--',
-            prepared_cmd.rule.pattern)
+        If the dry_run flag is True, the output will print to stderr what it
+        would do.
+    """
 
-def apply(spec: Iterable[ConfigSpecRule], dry_run: bool,
-          ignore_nonexisting: bool = False):
-    for cmd in prepare_cmd(spec):
-        if cmd.gitroot.exists() or ignore_nonexisting:
-            gitcmd = to_git_command(cmd)
-            if dry_run:
-                print(f"Would run: {' '.join(gitcmd)}", file=sys.stderr)
-            else:
-                print("SHARP.")
-                #sp.run(*gitcmd)
+    for cmd in commands_to_apply:
+        if dry_run:
+            print(f"Would run: {str(cmd)}", file=sys.stderr)
         else:
-            raise FileNotFoundError(f"Non-existing directory: {cmd.gitroot}")
+            logger.info("Executing: %s ", cmd)
+            subprocess.run(cmd.as_tuple(), check=True)
+
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Git ConfigSpec impersonator. Mimics "
@@ -100,23 +135,58 @@ if __name__ == "__main__":
                             "repositories.",
                             formatter_class=ArgumentDefaultsHelpFormatter)
     parser.add_argument("CONFIG_SPEC", default="CONFIG_SPEC", nargs="?",
-                        type=str, help="The config spec to use.")
-    parser.add_argument("--apply", action="store_true",
+                        type=Path, help="The config spec to use.")
+    grp = parser.add_mutually_exclusive_group()
+    grp.add_argument("--apply", action="store_true",
                         help="Apply the config spec by performing checkout "
                         "based on the rules.")
+    grp.add_argument("--stdout", action="store_true",
+                        help="Print git commands to stdout instead of "
+                        "executing them.")
     parser.add_argument("--ignore-nonexisting", action="store_true",
                         help="Do not check whether target patterns exist (i.e. "
-                        "files and folders).")
+                        "files and folders) before applying commands.")
+    parser.add_argument("-v", "--verbose", action="count", default=0,
+                        help="Set verbosity of messages.")
 
-    logging.basicConfig(level=logging.DEBUG, format="")
-    logger.setLevel(level=logging.DEBUG)
+    # Define error codes
+    E_NO_CONFIG_SPEC = 1
+    E_FILE_PATTERN_NONEXISTENT = 2
 
     args = parser.parse_args()
-    parsed = sorted(parse_file(args.CONFIG_SPEC))
 
-    # By default, do a dry-run.
+    # Set loglevel
+    LOG_LEVEL = logging.ERROR
+    if args.verbose == 1:
+        LOG_LEVEL = logging.INFO
+    elif args.verbose > 1:
+        LOG_LEVEL = logging.DEBUG
+
+    logging.basicConfig(format="%(levelname)-8s %(message)s")
+    logger.setLevel(level=LOG_LEVEL)
+
     try:
-        apply(parsed, not args.apply, args.ignore_nonexisting)
+        commands = to_commands(spec=sorted(parse_file(args.CONFIG_SPEC)),
+                               relative_root=args.CONFIG_SPEC.parent,
+                               ignore_nonexisting=args.ignore_nonexisting)
     except FileNotFoundError as Err:
-        print(Err, file=sys.stderr)
-        sys.exit(1)
+        if args.CONFIG_SPEC.exists():
+            print(Err, file=sys.stderr)
+            logger.error(Err)
+            logger.debug(traceback.format_exc())
+            sys.exit(E_FILE_PATTERN_NONEXISTENT)
+        else:
+            print(f"Unable to find config spec: {Err}", file=sys.stderr)
+            sys.exit(E_NO_CONFIG_SPEC)
+
+    if args.stdout:
+        for c in commands:
+            print(str(c), file=sys.stdout)
+    else:
+        try:
+            apply(commands,
+                not args.apply)
+        except subprocess.CalledProcessError as Err:
+            print(f"Git command invokation failed: {Err}", file=sys.stderr)
+            logger.error(Err)
+            logger.debug(traceback.format_exc())
