@@ -15,16 +15,16 @@ logger = logging.getLogger(__name__)
 # Regexes
 _COMMENT = re.compile(r"\s*#")
 _CS_SCOPE_RULE = re.compile(r"""(?P<scope>element)\s+
-                           (?P<pattern>(?:[^\"].+?|\".+\"))\s+
-                           (?P<versionSelector>\S+)
-                           (?:\s+(?P<optionalClause>.*))?""",
-                       re.X)
+                                (?P<pattern>(?:\".+\"|.+?))\s+
+                                (?P<selector>\S+)
+                                ([\t ]+(?P<optional>.*))?""",
+                            re.X)
 
 @dataclass
 class ConfigSpecRule:
     scope: str
     pattern: str
-    version_selector: str
+    selector: str
 
 def parse_file(path: Path) -> list:
     with open(path, 'r', encoding="utf8") as config_spec:
@@ -40,12 +40,11 @@ def parse_iterable(config_spec: Iterable[str]) -> Iterable[ConfigSpecRule]:
                 matches = _CS_SCOPE_RULE.match(line)
 
                 if matches:
-                    data.append(ConfigSpecRule(
-                                    scope=matches.group("scope"),
-                                    pattern=matches.group("pattern"),
-                                    version_selector=
-                                    matches.group("versionSelector"))
-                    )
+                    data.append(
+                        ConfigSpecRule(
+                            scope=matches.group("scope"),
+                            pattern=matches.group("pattern").strip("\""),
+                            selector=matches.group("selector")))
                 else:
                     logger.debug("No rule match on line %d", line_no)
     return data
@@ -53,17 +52,14 @@ def parse_iterable(config_spec: Iterable[str]) -> Iterable[ConfigSpecRule]:
 if __name__ == "__main__":
     parser = ArgumentParser(description="Git ConfigSpec impersonator. Mimics "
                             "the ClearCase ConfigSpec behaviour for a set of "
-                            "repositories.")
+                            "repositories.",
+                            formatter_class=ArgumentDefaultsHelpFormatter)
     parser.add_argument("CONFIG_SPEC", type=str, help="The config spec to use.")
-    parser.add_argument("--verify-paths", action="store_true",
-                        help="Verify the the config spec paths.")
-    parser.add_argument("--verify", action="store_true",
-                        help="Verify the consistency of the config spec paths.")
-    parser.add_argument("-n", "--dry-run", action="store_true",
-                        help="Dont do anything")
+    parser.add_argument("--apply", action="store_true",
+                        help="Apply the config spec by performing checkout "
+                        "based on the rules.")
 
     logging.basicConfig(level=logging.DEBUG, format="")
-    
     logger.setLevel(level=logging.DEBUG)
 
     args = parser.parse_args()
